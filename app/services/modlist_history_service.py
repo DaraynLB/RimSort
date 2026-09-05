@@ -461,6 +461,66 @@ class ModlistHistoryService:
         """Diff two snapshots (``old`` -> ``new``)."""
         return self._diff_entries(old.active, new.active, old.inactive, new.inactive)
 
+    def entries_from_package_ids(self, package_ids: list[str]) -> list[SnapshotEntry]:
+        """Resolve package IDs from an external mod list file to entries,
+        using whatever mod metadata RimSort currently has on hand.
+
+        A mod RimSort doesn't currently know about (uninstalled since the
+        file was saved, or never installed) still gets an entry — just with
+        no name or workshop id, since a bare package id is all the file
+        gives us for it.
+        """
+        entries: list[SnapshotEntry] = []
+        seen: set[str] = set()
+        for package_id in package_ids:
+            pid_lower = package_id.lower()
+            if not pid_lower or pid_lower in seen:
+                continue
+            seen.add(pid_lower)
+            mod = None
+            for path in self.metadata_controller.packageid_to_paths.get(
+                pid_lower, set()
+            ):
+                mod = self.metadata_controller.get_mod(path)
+                if mod is not None:
+                    break
+            if mod is None:
+                entries.append(
+                    SnapshotEntry(
+                        package_id=package_id,
+                        name="",
+                        published_file_id=None,
+                        source="unknown",
+                    )
+                )
+                continue
+            pfid = getattr(mod, "published_file_id", None)
+            mod_type = getattr(mod, "mod_type", None)
+            entries.append(
+                SnapshotEntry(
+                    package_id=package_id,
+                    name=str(getattr(mod, "name", "") or ""),
+                    published_file_id=str(pfid) if pfid else None,
+                    source=mod_type.name.lower() if mod_type is not None else "unknown",
+                )
+            )
+        return entries
+
+    def diff_against_file(
+        self, snapshot: Snapshot, file_active_package_ids: list[str]
+    ) -> ModListDiff:
+        """Diff a snapshot's mod set against a saved mod list file's active list.
+
+        The file is the "old"/baseline side. A saved mod list file has no
+        inactive-list concept, so "added" can't distinguish a freshly
+        installed mod from one that was merely inactive when the file was
+        saved — every added mod shows plain. "Removed" keeps its
+        deactivated/uninstalled distinction, since that's resolved against
+        the snapshot's real inactive list, not the file.
+        """
+        file_active = self.entries_from_package_ids(file_active_package_ids)
+        return self._diff_entries(file_active, snapshot.active, [], snapshot.inactive)
+
     @staticmethod
     def _diff_entries(
         old_active: list[SnapshotEntry],

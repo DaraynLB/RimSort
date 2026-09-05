@@ -1,6 +1,7 @@
 """Dialog for browsing and comparing mod list history snapshots."""
 
 from collections.abc import Callable
+from pathlib import Path
 
 from loguru import logger
 from PySide6.QtCore import Qt
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.services.mod_list_parser import ModListFormatError, parse_mod_list_file
 from app.services.modlist_history_service import (
     KeptEntry,
     ModListDiff,
@@ -30,6 +32,7 @@ from app.services.modlist_history_service import (
     Snapshot,
     SnapshotEntry,
 )
+from app.utils.app_info import AppInfo
 from app.utils.generic import open_url_browser, platform_specific_open
 from app.views import dialogue
 
@@ -114,6 +117,16 @@ class ModlistHistoryPanel(QDialog):
         self.note_button = QPushButton(self.tr("Edit Note…"))
         self.note_button.clicked.connect(self._on_edit_note)
         button_row.addWidget(self.note_button)
+
+        self.compare_file_button = QPushButton(self.tr("Compare Against File…"))
+        self.compare_file_button.setToolTip(
+            self.tr(
+                "Diff the selected snapshot against a saved mod list file "
+                "(RimWorld ModsConfig-style .xml/.rml/.rws)."
+            )
+        )
+        self.compare_file_button.clicked.connect(self._on_compare_file)
+        button_row.addWidget(self.compare_file_button)
 
         button_row.addStretch()
 
@@ -238,7 +251,13 @@ class ModlistHistoryPanel(QDialog):
                 old=older.display_timestamp, new=newer.display_timestamp
             )
         )
+        self._render_diff_columns(diff)
 
+    def _render_diff_columns(self, diff: ModListDiff) -> None:
+        """Fill the three columns from a diff. Shared by snapshot-vs-snapshot
+        and snapshot-vs-file comparisons; only ``comparing_label`` differs
+        between them, and callers set that themselves.
+        """
         if diff.is_empty:
             self.added_header.setText(self.tr("Added (0)"))
             self.kept_header.setText(self.tr("Kept the same (0)"))
@@ -341,6 +360,7 @@ class ModlistHistoryPanel(QDialog):
         self.restore_button.setEnabled(one_selected)
         self.export_button.setEnabled(one_selected)
         self.note_button.setEnabled(one_selected)
+        self.compare_file_button.setEnabled(one_selected)
 
     def _current_snapshot(self) -> Snapshot | None:
         indices = self._selected_indices()
@@ -425,6 +445,43 @@ class ModlistHistoryPanel(QDialog):
             )
             return
         self._reload()
+
+    def _on_compare_file(self) -> None:
+        """Diff the selected snapshot against a saved mod list file.
+
+        The file is a plain package-id list (RimWorld ModsConfig-style XML,
+        or RimSort's own JSON export) with no inactive-list concept, unlike
+        a snapshot — see ``ModlistHistoryService.diff_against_file``.
+        """
+        snap = self._current_snapshot()
+        if snap is None:
+            return
+        file_path = dialogue.show_dialogue_file(
+            mode="open",
+            caption=self.tr("Compare against mod list file"),
+            _dir=str(AppInfo().saved_modlists_folder),
+            _filter=self.tr("RimWorld mod list (*.rml *.rws *.xml)"),
+        )
+        if not file_path:
+            return
+        try:
+            parsed = parse_mod_list_file(file_path)
+        except ModListFormatError as exc:
+            dialogue.show_warning(
+                title=self.tr("Could not read file"),
+                text=self.tr("Could not parse the selected mod list file."),
+                information=str(exc),
+            )
+            return
+
+        diff = self._service.diff_against_file(snap, parsed.package_ids)
+        self._clear_diff_columns()
+        self.comparing_label.setText(
+            self.tr("Comparing file {name} → {snap}").format(
+                name=Path(file_path).name, snap=snap.display_timestamp
+            )
+        )
+        self._render_diff_columns(diff)
 
     def _on_open_folder(self) -> None:
         platform_specific_open(str(self._service.history_dir()))

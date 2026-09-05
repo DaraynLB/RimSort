@@ -31,6 +31,10 @@ class _StubMetadataController:
     def get_mod(self, uuid: str) -> _StubMod | None:
         return self._mods.get(uuid)
 
+    @property
+    def packageid_to_paths(self) -> dict[str, set[str]]:
+        return {pid.lower(): {pid} for pid in self._mods}
+
 
 class _StubSettings:
     current_instance = "Default"
@@ -170,3 +174,53 @@ class TestDiff:
         snap = service.write_snapshot(["a.mod", "b.mod"], [])
         assert snap is not None
         assert service.diff(snap, snap).is_empty
+
+
+class TestEntriesFromPackageIds:
+    def test_resolves_known_and_unknown_ids(self) -> None:
+        service, _ = _make_service(["a.mod", "steam.mod"])
+        entries = service.entries_from_package_ids(["a.mod", "steam.mod", "ghost.mod"])
+        by_id = {e.package_id: e for e in entries}
+
+        assert by_id["a.mod"].name == "Mod"  # from the _make_service name stub
+        assert by_id["steam.mod"].source == "steam_workshop"
+        # A mod RimSort doesn't currently know about still gets an entry —
+        # just with nothing but the bare package id.
+        assert by_id["ghost.mod"].name == ""
+        assert by_id["ghost.mod"].source == "unknown"
+        assert by_id["ghost.mod"].published_file_id is None
+
+    def test_deduplicates_case_insensitively(self) -> None:
+        service, _ = _make_service(["a.mod"])
+        entries = service.entries_from_package_ids(["a.mod", "A.MOD", "a.mod"])
+        assert len(entries) == 1
+
+
+class TestDiffAgainstFile:
+    def test_file_is_active_only_baseline(self) -> None:
+        """The file (old/baseline side) has no inactive-list concept: Added
+        can't distinguish "freshly installed" from "was inactive in the
+        file" (there's no such thing), but Removed can still tell apart
+        "deactivated" (in the snapshot's real inactive list) from "gone
+        entirely" — that distinction comes from the snapshot, not the file.
+        """
+        service, _ = _make_service(["a.mod", "b.mod", "c.mod", "d.mod"])
+        snap = service.write_snapshot(["a.mod", "d.mod"], ["b.mod"])
+        assert snap is not None
+
+        # The file recorded a.mod, b.mod, c.mod as active.
+        diff = service.diff_against_file(snap, ["a.mod", "b.mod", "c.mod"])
+
+        # d.mod is active in the snapshot but wasn't in the file at all —
+        # added, with no "activated" note possible (the file has no
+        # inactive list to have been activated from).
+        added_by_id = {e.entry.package_id: e for e in diff.added}
+        assert set(added_by_id) == {"d.mod"}
+        assert not added_by_id["d.mod"].pre_existing
+
+        removed_by_id = {e.entry.package_id: e for e in diff.removed}
+        assert set(removed_by_id) == {"b.mod", "c.mod"}
+        assert removed_by_id["b.mod"].pre_existing  # in the snapshot's inactive list
+        assert not removed_by_id["c.mod"].pre_existing  # not in the snapshot at all
+
+        assert {k.entry.package_id for k in diff.kept} == {"a.mod"}
