@@ -54,7 +54,15 @@ class SnapshotEntry:
 
     @property
     def label(self) -> str:
-        return f"{self.name} [{self.package_id}]" if self.name else self.package_id
+        """Display name, falling back to the package id if the mod has none."""
+        return self.name or self.package_id
+
+    @property
+    def workshop_url(self) -> str | None:
+        """Steam Workshop page for this mod, if it has a published file id."""
+        if not self.published_file_id:
+            return None
+        return f"https://steamcommunity.com/sharedfiles/filedetails/?id={self.published_file_id}"
 
 
 @dataclass
@@ -90,33 +98,65 @@ class Snapshot:
 
 
 @dataclass
-class ModListDiff:
-    """The difference between two snapshots."""
+class KeptEntry:
+    """A mod whose active/inactive membership did not change between the two
+    snapshots: active in both (optionally reordered), or inactive in both.
 
-    active_added: list[SnapshotEntry] = field(default_factory=list)
-    active_removed: list[SnapshotEntry] = field(default_factory=list)
-    active_reordered: list[SnapshotEntry] = field(default_factory=list)
-    inactive_added: list[SnapshotEntry] = field(default_factory=list)
-    inactive_removed: list[SnapshotEntry] = field(default_factory=list)
+    ``old_position``/``new_position`` (1-based) note a reorder within the
+    active list. A ``KeptEntry`` with neither set was untouched.
+    """
+
+    entry: SnapshotEntry
+    old_position: int | None = None
+    new_position: int | None = None
+
+    @property
+    def changed(self) -> bool:
+        return self.old_position is not None
+
+
+@dataclass
+class NotedEntry:
+    """A mod entry for the Added/Removed columns.
+
+    ``pre_existing`` is True when the mod already existed in the other
+    snapshot and merely crossed the active/inactive boundary — activated
+    (in ``added``) or deactivated (in ``removed``) — rather than being
+    freshly installed or fully uninstalled.
+    """
+
+    entry: SnapshotEntry
+    pre_existing: bool = False
+
+
+@dataclass
+class ModListDiff:
+    """The difference between two snapshots, grouped as added / kept / removed.
+
+    ``added``/``removed`` are about *active-list* membership: a mod lands in
+    ``removed`` whether it was deactivated (still installed) or fully
+    uninstalled, and in ``added`` whether it was freshly installed active or
+    just activated from the inactive list — ``NotedEntry.pre_existing``
+    distinguishes the two cases in each bucket.
+    """
+
+    added: list[NotedEntry] = field(default_factory=list)
+    removed: list[NotedEntry] = field(default_factory=list)
+    kept: list[KeptEntry] = field(default_factory=list)
+
+    @property
+    def changed_count(self) -> int:
+        """Kept mods that were reordered."""
+        return sum(1 for k in self.kept if k.changed)
 
     @property
     def is_empty(self) -> bool:
-        return not (
-            self.active_added
-            or self.active_removed
-            or self.active_reordered
-            or self.inactive_added
-            or self.inactive_removed
-        )
+        return not (self.added or self.removed or self.changed_count)
 
     @property
     def summary(self) -> str:
-        """Compact ``+a -r ~m`` counts, active list only."""
-        return (
-            f"+{len(self.active_added)} "
-            f"-{len(self.active_removed)} "
-            f"~{len(self.active_reordered)}"
-        )
+        """Compact ``+a -r ~m`` counts."""
+        return f"+{len(self.added)} -{len(self.removed)} ~{self.changed_count}"
 
 
 def compute_list_id(package_ids: list[str]) -> str:
@@ -436,27 +476,64 @@ class ModlistHistoryService:
         old_inactive_map = {key(e): e for e in old_inactive}
         new_inactive_map = {key(e): e for e in new_inactive}
 
-        result = ModListDiff()
-        result.active_added = [e for e in new_active if key(e) not in old_active_map]
-        result.active_removed = [e for e in old_active if key(e) not in new_active_map]
+        old_keys = set(old_active_map) | set(old_inactive_map)
+        new_keys = set(new_active_map) | set(new_inactive_map)
 
-        # Reorder detection: compare the two sequences restricted to the mods
-        # that are present in both, then flag the mods difflib does not place
-        # in an "equal" block (the minimal moved set).
-        common_old = [key(e) for e in old_active if key(e) in new_active_map]
-        common_new = [key(e) for e in new_active if key(e) in old_active_map]
+        result = ModListDiff()
+
+        # Added: entered the active list, either freshly installed there or
+        # activated from the inactive list. A mod that's freshly installed
+        # straight into the inactive list (never touched active) is added
+        # too, just with nothing special to note.
+        for e in new_active:
+            k = key(e)
+            if k not in old_keys:
+                result.added.append(NotedEntry(entry=e))
+            elif k in old_inactive_map and k not in old_active_map:
+                result.added.append(NotedEntry(entry=e, pre_existing=True))
+        for e in new_inactive:
+            if key(e) not in old_keys:
+                result.added.append(NotedEntry(entry=e))
+
+        # Removed: left the active list, either fully uninstalled or just
+        # deactivated (still installed, moved to inactive).
+        for e in old_active:
+            k = key(e)
+            if k not in new_keys:
+                result.removed.append(NotedEntry(entry=e))
+            elif k in new_inactive_map and k not in new_active_map:
+                result.removed.append(NotedEntry(entry=e, pre_existing=True))
+        for e in old_inactive:
+            if key(e) not in new_keys:
+                result.removed.append(NotedEntry(entry=e))
+
+        # Reorder detection within the active list, restricted to mods that
+        # were active in both snapshots (activation/deactivation is reported
+        # above instead, not as a "reorder").
+        common_old_active = [key(e) for e in old_active if key(e) in new_active_map]
+        common_new_active = [key(e) for e in new_active if key(e) in old_active_map]
+        old_positions = {k: i + 1 for i, k in enumerate(common_old_active)}
+        new_positions = {k: i + 1 for i, k in enumerate(common_new_active)}
         moved: set[str] = set()
-        matcher = difflib.SequenceMatcher(a=common_old, b=common_new, autojunk=False)
+        matcher = difflib.SequenceMatcher(
+            a=common_old_active, b=common_new_active, autojunk=False
+        )
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
             if tag != "equal":
-                moved.update(common_old[i1:i2])
-                moved.update(common_new[j1:j2])
-        result.active_reordered = [e for e in new_active if key(e) in moved]
+                moved.update(common_old_active[i1:i2])
+                moved.update(common_new_active[j1:j2])
 
-        result.inactive_added = [
-            e for e in new_inactive if key(e) not in old_inactive_map
-        ]
-        result.inactive_removed = [
-            e for e in old_inactive if key(e) not in new_inactive_map
-        ]
+        # Kept: active-list membership unchanged — active in both (maybe
+        # reordered) or inactive in both (untouched).
+        for e in new_active:
+            k = key(e)
+            if k in old_active_map:
+                kept = KeptEntry(entry=e)
+                if k in moved:
+                    kept.old_position = old_positions[k]
+                    kept.new_position = new_positions[k]
+                result.kept.append(kept)
+        for e in new_inactive:
+            if key(e) in old_inactive_map:
+                result.kept.append(KeptEntry(entry=e))
         return result

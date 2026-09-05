@@ -124,20 +124,46 @@ class TestPrune:
 
 class TestDiff:
     def test_detects_add_remove_reorder(self) -> None:
-        service, _ = _make_service(["a.mod", "b.mod", "c.mod", "d.mod"])
+        service, _ = _make_service(["a.mod", "b.mod", "c.mod", "d.mod", "e.mod"])
         old = service.write_snapshot(["a.mod", "b.mod", "c.mod"], ["d.mod"])
-        new = service.write_snapshot(["a.mod", "c.mod", "b.mod", "d.mod"], [])
+        new = service.write_snapshot(["a.mod", "c.mod", "b.mod", "d.mod"], ["e.mod"])
 
         assert old is not None and new is not None
         diff = service.diff(old, new)
 
-        assert [e.package_id for e in diff.active_added] == ["d.mod"]
-        assert diff.active_removed == []
-        reordered = {e.package_id for e in diff.active_reordered}
+        # d.mod entered the active list from inactive (activated); e.mod is
+        # genuinely new. Both land in "added" — Added is about active-list
+        # membership, not just "is this freshly installed".
+        added_by_id = {e.entry.package_id: e for e in diff.added}
+        assert set(added_by_id) == {"d.mod", "e.mod"}
+        assert added_by_id["d.mod"].pre_existing
+        assert not added_by_id["e.mod"].pre_existing
+        assert diff.removed == []
+
+        kept_by_id = {k.entry.package_id: k for k in diff.kept}
+        # a.mod's position was untouched.
+        assert not kept_by_id["a.mod"].changed
         # b and c swapped; difflib flags the minimal moved set (at least one of them).
+        reordered = {pid for pid, k in kept_by_id.items() if k.old_position is not None}
         assert reordered
         assert reordered <= {"b.mod", "c.mod"}
-        assert [e.package_id for e in diff.inactive_removed] == ["d.mod"]
+
+    def test_deactivated_and_uninstalled_are_both_removed(self) -> None:
+        """Removed covers anything that left the active list: still-installed
+        (deactivated) or fully gone (uninstalled) — each flagged distinctly.
+        """
+        service, _ = _make_service(["a.mod", "b.mod", "c.mod"])
+        old = service.write_snapshot(["a.mod", "b.mod"], ["c.mod"])
+        new = service.write_snapshot(["a.mod"], ["b.mod"])
+
+        assert old is not None and new is not None
+        diff = service.diff(old, new)
+
+        removed_by_id = {e.entry.package_id: e for e in diff.removed}
+        assert set(removed_by_id) == {"b.mod", "c.mod"}
+        assert removed_by_id["b.mod"].pre_existing  # deactivated, still installed
+        assert not removed_by_id["c.mod"].pre_existing  # fully uninstalled
+        assert diff.added == []
 
     def test_empty_diff_for_same_snapshot(self) -> None:
         service, _ = _make_service(["a.mod", "b.mod"])

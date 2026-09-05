@@ -4,10 +4,12 @@ from collections.abc import Callable
 
 from loguru import logger
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QListWidget,
@@ -21,12 +23,14 @@ from PySide6.QtWidgets import (
 )
 
 from app.services.modlist_history_service import (
+    KeptEntry,
     ModListDiff,
     ModlistHistoryService,
+    NotedEntry,
     Snapshot,
     SnapshotEntry,
 )
-from app.utils.generic import platform_specific_open
+from app.utils.generic import open_url_browser, platform_specific_open
 from app.views import dialogue
 
 
@@ -74,14 +78,27 @@ class ModlistHistoryPanel(QDialog):
         self.snapshot_list.itemSelectionChanged.connect(self._on_selection_changed)
         splitter.addWidget(self.snapshot_list)
 
-        self.diff_tree = QTreeWidget()
-        self.diff_tree.setHeaderLabels([self.tr("Change"), self.tr("Mod")])
-        self.diff_tree.setColumnWidth(0, 160)
-        self.diff_tree.setRootIsDecorated(True)
-        splitter.addWidget(self.diff_tree)
+        self.diff_panel = QWidget()
+        diff_layout = QVBoxLayout(self.diff_panel)
+        diff_layout.setContentsMargins(0, 0, 0, 0)
 
+        self.comparing_label = QLabel()
+        self.comparing_label.setWordWrap(True)
+        diff_layout.addWidget(self.comparing_label)
+
+        columns_layout = QHBoxLayout()
+        diff_layout.addLayout(columns_layout, 1)
+        self.added_header, self.added_tree = self._make_diff_column(columns_layout)
+        self.kept_header, self.kept_tree = self._make_diff_column(columns_layout)
+        self.removed_header, self.removed_tree = self._make_diff_column(columns_layout)
+        for tree in (self.added_tree, self.kept_tree, self.removed_tree):
+            tree.itemClicked.connect(self._on_diff_item_clicked)
+            tree.setMouseTracking(True)
+            tree.itemEntered.connect(self._on_diff_item_hovered)
+
+        splitter.addWidget(self.diff_panel)
         splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(1, 3)
 
         button_row = QHBoxLayout()
 
@@ -110,6 +127,34 @@ class ModlistHistoryPanel(QDialog):
 
         layout.addLayout(button_row)
 
+    @staticmethod
+    def _make_diff_column(parent_layout: QHBoxLayout) -> tuple[QLabel, QTreeWidget]:
+        """Build one "Added"/"Kept"/"Removed" column: a header label over a
+        plain, read-only two-column list (mod name, optional note).
+
+        The note gets its own column rather than being appended to the mod
+        name in one string — that reads as clutter once a mod can carry a
+        note like "deactivated" or "moved #12 → #45".
+        """
+        container = QVBoxLayout()
+        header = QLabel()
+        header.setObjectName("diffColumnHeader")
+        container.addWidget(header)
+        tree = QTreeWidget()
+        tree.setHeaderHidden(True)
+        tree.setColumnCount(2)
+        tree.setRootIsDecorated(False)
+        tree.setIndentation(0)
+        tree.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        tree.header().setStretchLastSection(False)
+        tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        container.addWidget(tree, 1)
+        wrapper = QWidget()
+        wrapper.setLayout(container)
+        parent_layout.addWidget(wrapper, 1)
+        return header, tree
+
     # ------------------------------------------------------------------ data
     def _reload(self) -> None:
         self._snapshots = self._service.list_snapshots()
@@ -129,14 +174,10 @@ class ModlistHistoryPanel(QDialog):
         if self._snapshots:
             self.snapshot_list.setCurrentRow(0)
         else:
-            self.diff_tree.clear()
-            placeholder = QTreeWidgetItem(
-                [
-                    self.tr("No snapshots yet"),
-                    self.tr("Save your mod list to create one"),
-                ]
+            self._clear_diff_columns()
+            self.comparing_label.setText(
+                self.tr("No snapshots yet — save your mod list to create one.")
             )
-            self.diff_tree.addTopLevelItem(placeholder)
 
     def _selected_indices(self) -> list[int]:
         indices = [
@@ -162,19 +203,14 @@ class ModlistHistoryPanel(QDialog):
     # --------------------------------------------------------------- events
     def _on_selection_changed(self) -> None:
         self._update_buttons()
-        self.diff_tree.clear()
+        self._clear_diff_columns()
 
         pair = self._selected_pair()
         if pair is None:
             indices = self._selected_indices()
             if len(indices) == 1:
-                self.diff_tree.addTopLevelItem(
-                    QTreeWidgetItem(
-                        [
-                            self.tr("Oldest snapshot"),
-                            self.tr("Nothing to compare against"),
-                        ]
-                    )
+                self.comparing_label.setText(
+                    self.tr("Oldest snapshot — nothing to compare against.")
                 )
             return
 
@@ -186,48 +222,119 @@ class ModlistHistoryPanel(QDialog):
             return
         self._render_diff(older, newer, diff)
 
+    def _clear_diff_columns(self) -> None:
+        self.comparing_label.clear()
+        for header, tree in (
+            (self.added_header, self.added_tree),
+            (self.kept_header, self.kept_tree),
+            (self.removed_header, self.removed_tree),
+        ):
+            header.clear()
+            tree.clear()
+
     def _render_diff(self, older: Snapshot, newer: Snapshot, diff: ModListDiff) -> None:
-        header = QTreeWidgetItem(
-            [
-                self.tr("Comparing"),
-                self.tr("{old} → {new}").format(
-                    old=older.display_timestamp, new=newer.display_timestamp
-                ),
-            ]
+        self.comparing_label.setText(
+            self.tr("Comparing {old} → {new}").format(
+                old=older.display_timestamp, new=newer.display_timestamp
+            )
         )
-        self.diff_tree.addTopLevelItem(header)
 
         if diff.is_empty:
-            self.diff_tree.addTopLevelItem(
-                QTreeWidgetItem([self.tr("No differences"), ""])
-            )
+            self.added_header.setText(self.tr("Added (0)"))
+            self.kept_header.setText(self.tr("Kept the same (0)"))
+            self.removed_header.setText(self.tr("Removed (0)"))
+            self.kept_tree.addTopLevelItem(QTreeWidgetItem([self.tr("No differences")]))
             return
 
-        self._add_diff_group(self.tr("Added to active ({n})"), diff.active_added, "+")
-        self._add_diff_group(
-            self.tr("Removed from active ({n})"), diff.active_removed, "−"
+        self._fill_diff_column(
+            self.added_header,
+            self.added_tree,
+            self.tr("Added ({n})"),
+            diff.added,
+            self.tr("activated"),
         )
-        self._add_diff_group(self.tr("Reordered ({n})"), diff.active_reordered, "~")
-        self._add_diff_group(
-            self.tr("Newly installed / disabled ({n})"), diff.inactive_added, "+"
+        self._fill_kept_column(diff.kept)
+        self._fill_diff_column(
+            self.removed_header,
+            self.removed_tree,
+            self.tr("Removed ({n})"),
+            diff.removed,
+            self.tr("deactivated"),
         )
-        self._add_diff_group(
-            self.tr("No longer installed ({n})"), diff.inactive_removed, "−"
-        )
-        self.diff_tree.expandAll()
 
-    def _add_diff_group(
-        self, title_template: str, entries: list[SnapshotEntry], marker: str
+    def _fill_diff_column(
+        self,
+        header: QLabel,
+        tree: QTreeWidget,
+        title_template: str,
+        entries: list[NotedEntry],
+        pre_existing_note: str,
     ) -> None:
-        if not entries:
+        """Fill an Added/Removed column.
+
+        ``pre_existing_note`` labels entries where the mod already existed in
+        the other snapshot and just crossed the active/inactive boundary
+        (e.g. "activated"/"deactivated"); a plain install/uninstall gets no
+        note, since the column itself already says what happened.
+        """
+        header.setText(title_template.format(n=len(entries)))
+        for noted in entries:
+            note = pre_existing_note if noted.pre_existing else ""
+            item = QTreeWidgetItem([noted.entry.label, note])
+            self._style_entry_item(item, noted.entry)
+            tree.addTopLevelItem(item)
+
+    def _fill_kept_column(self, kept: list[KeptEntry]) -> None:
+        """Fill the "Kept the same" column: every mod whose active/inactive
+        membership didn't change, with a note for the ones reordered within
+        the active list.
+        """
+        self.kept_header.setText(self.tr("Kept the same ({n})").format(n=len(kept)))
+        for kept_entry in kept:
+            note = ""
+            if kept_entry.old_position is not None:
+                note = self.tr("moved #{old} → #{new}").format(
+                    old=kept_entry.old_position, new=kept_entry.new_position
+                )
+            item = QTreeWidgetItem([kept_entry.entry.label, note])
+            self._style_entry_item(item, kept_entry.entry)
+            self.kept_tree.addTopLevelItem(item)
+
+    def _style_entry_item(self, item: QTreeWidgetItem, entry: SnapshotEntry) -> None:
+        """Attach the package id / source to the tooltip, and turn the mod
+        name into a clickable Steam Workshop link when it has one.
+
+        The package id used to be concatenated onto the visible name; it
+        lives in the tooltip now so the row stays readable.
+        """
+        tooltip_lines = [self.tr("Package ID: {pid}").format(pid=entry.package_id)]
+        if entry.source and entry.source != "unknown":
+            tooltip_lines.append(self.tr("Source: {src}").format(src=entry.source))
+        workshop_url = entry.workshop_url
+        if workshop_url:
+            tooltip_lines.append(self.tr("Click to open Workshop page"))
+            font = item.font(0)
+            font.setUnderline(True)
+            item.setFont(0, font)
+            item.setForeground(0, QColor("#4EA6ED"))
+        item.setToolTip(0, "\n".join(tooltip_lines))
+        item.setData(0, Qt.ItemDataRole.UserRole, workshop_url)
+
+    def _on_diff_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        url = item.data(0, Qt.ItemDataRole.UserRole)
+        if url:
+            open_url_browser(url)
+
+    @staticmethod
+    def _on_diff_item_hovered(item: QTreeWidgetItem, column: int) -> None:
+        """Show a pointing-hand cursor only over rows with a Workshop link."""
+        tree = item.treeWidget()
+        if tree is None:
             return
-        group = QTreeWidgetItem([title_template.format(n=len(entries)), ""])
-        self.diff_tree.addTopLevelItem(group)
-        for entry in entries:
-            child = QTreeWidgetItem([marker, entry.label])
-            if entry.source and entry.source != "unknown":
-                child.setToolTip(1, self.tr("Source: {src}").format(src=entry.source))
-            group.addChild(child)
+        has_url = bool(item.data(0, Qt.ItemDataRole.UserRole))
+        tree.viewport().setCursor(
+            Qt.CursorShape.PointingHandCursor if has_url else Qt.CursorShape.ArrowCursor
+        )
 
     def _update_buttons(self) -> None:
         one_selected = len(self._selected_indices()) == 1
